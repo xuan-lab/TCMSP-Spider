@@ -4,24 +4,23 @@ import time
 import os
 import math # To check for NaN
 import re   # To clean strings for float conversion
+import argparse # << NEW: For command-line arguments >>
+import sys # << NEW: For command-line arguments >>
 
 # --- Dependencies ---
 # This script requires 'pubchempy', 'pandas', and 'openpyxl'.
 # If you don't have them installed, run: pip install pubchempy pandas openpyxl
 
 # --- Configuration ---
-# Input file containing data to check
-input_file = 'merged_table_with_pubchem_id.xlsx'
-# Output file for the verified and potentially updated data
-output_file_detailed = 'pubchem_verified_data.xlsx'
-# Output file for the summary view (ID, Name, Status)
-output_file_summary = 'pubchem_verification_summary_by_name.xlsx'
+# --- Input/Output filenames are now handled by command-line arguments ---
+# output_file_detailed = 'pubchem_verified_data.xlsx' # Removed hardcoded name
+# output_file_summary = 'pubchem_verification_summary_by_name.xlsx' # Removed hardcoded name
 
 # !!! IMPORTANT: Define column names from your input file used for hierarchical lookup !!!
 # The script will try these in order. Ensure they match your Excel file exactly.
 name_col = 'molecule_name'     # 1st priority for lookup (and used for summary)
 alias_col = 'Alias'            # 2nd priority for lookup
-cas_id_col = 'CAS_id'          # << NEEDED for cross-validation check >>
+cas_id_col = 'CAS_id'          # Used for cross-validation check reporting
 pubchem_id_col = 'PubChem_id'  # 3rd priority for lookup
 
 # Limit the number of subsequent aliases to try IF the first alias fails
@@ -133,9 +132,37 @@ def find_name_column(df_columns):
 
 # --- Main Verification Script ---
 if __name__ == "__main__":
+    # --- Argument Parsing --- <<< NEW >>>
+    parser = argparse.ArgumentParser(description='PubChem 数据核对与更新脚本 (名称优先查找 + 仅报告交叉验证)')
+    parser.add_argument('input_file', type=str, help='输入的包含待核对数据的 Excel 文件路径 (.xlsx)')
+    # Check if any arguments were passed, provide help if not
+    if len(sys.argv) == 1:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
+    args = parser.parse_args()
+    input_file = args.input_file
+
+    # --- Derive Output Filenames --- <<< MODIFIED >>>
+    input_dir = os.path.dirname(input_file)
+    base_name, ext = os.path.splitext(os.path.basename(input_file))
+    if ext.lower() != '.xlsx':
+         print(f"错误：输入文件 '{input_file}' 必须是 .xlsx 格式。")
+         sys.exit(1)
+
+    # Define and create the output directory
+    output_dir = os.path.join(input_dir, 'verified_file')
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"输出目录: {output_dir}")
+
+    # Define output file paths within the new directory
+    output_file_detailed = os.path.join(output_dir, f"{base_name}_verified{ext}")
+    output_file_summary = os.path.join(output_dir, f"{base_name}_summary{ext}")
+
     print("重要提示：此脚本需要 'pubchempy', 'pandas', 'openpyxl' 库。")
     print("如果尚未安装，请在终端运行: pip install pubchempy pandas openpyxl\n")
-    print(f"正在加载输入文件: {input_file}")
+    print(f"输入文件: {input_file}")
+    print(f"详细输出文件: {output_file_detailed}")
+    print(f"摘要输出文件: {output_file_summary}")
 
     if not os.path.exists(input_file):
         print(f"错误：输入文件 '{input_file}' 未找到。")
@@ -149,20 +176,21 @@ if __name__ == "__main__":
 
     # --- Validate essential lookup and validation columns exist ---
     lookup_cols_needed = [name_col, alias_col, pubchem_id_col]
-    validation_cols_needed = [cas_id_col, pubchem_id_col] # Need these for validation check reporting
+    validation_cols_needed = [cas_id_col, pubchem_id_col]
     required_cols = list(set(lookup_cols_needed + validation_cols_needed))
-
     missing_required_cols = [col for col in required_cols if col not in df.columns]
     if missing_required_cols:
         print(f"错误：输入文件中缺少用于查找或交叉验证报告的必要列: {', '.join(missing_required_cols)}")
         exit()
+    if cas_id_col not in df.columns: # Check specifically for CAS column for warning
+         print(f"警告: 输入文件中缺少列 '{cas_id_col}'，交叉验证检查将受限。")
 
 
     status_column = 'PubChem_Verification_Status'
     if status_column not in df.columns:
         df[status_column] = '未处理'
 
-    print("\n开始 PubChem 数据核对与更新 (名称优先查找 + 仅报告交叉验证)...") # Updated description
+    print("\n开始 PubChem 数据核对与更新 (名称优先查找 + 仅报告交叉验证)...")
     print(f"查找顺序: '{name_col}' -> 第1个'{alias_col}' -> 后续'{alias_col}' (最多{max_subsequent_aliases_to_try}个, 检查内部一致性) -> '{pubchem_id_col}'")
     print("交叉验证: 对名称/别名匹配结果进行检查，但仅报告不一致，不否决匹配。")
     print("警告：优先使用名称/别名查找仍可能存在风险！")
@@ -177,7 +205,7 @@ if __name__ == "__main__":
     error_indices = set()
     multi_match_indices = set()
     no_match_indices = set()
-    cross_validation_failures_reported = 0 # Counter for reported failures
+    cross_validation_failures_reported = 0
 
 
     # --- Main Checking Loop ---
@@ -187,13 +215,13 @@ if __name__ == "__main__":
         found_compound = None
         found_by = None
         potential_compound = None
-        cross_validation_passed = True # Assume pass unless check fails
+        cross_validation_passed = True
 
         original_cid_for_validation = get_valid_cid(row.get(pubchem_id_col))
-        original_cas_for_validation = get_valid_cas(row.get(cas_id_col))
+        original_cas_for_validation = get_valid_cas(row.get(cas_id_col)) if cas_id_col in df.columns else None # Handle missing CAS col
 
         # --- Hierarchical Lookup (First Alias Priority, Reporting-Only Cross-Validation) ---
-
+        # (Lookup logic remains the same as previous version)
         # Step 1: Try finding by Name
         name_value = row.get(name_col)
         if not is_nan_or_none(name_value) and str(name_value).strip() != '':
@@ -203,26 +231,17 @@ if __name__ == "__main__":
                     potential_compound = pcp.Compound.from_cid(cids[0])
                     time.sleep(api_delay)
                     if potential_compound:
-                        # --- Perform Cross-Validation Check (Informational Only) ---
                         validated = False
                         if original_cid_for_validation and potential_compound.cid == original_cid_for_validation: validated = True
                         elif original_cas_for_validation and potential_compound.synonyms:
                              pubchem_cas_list_for_val = [get_valid_cas(syn) for syn in potential_compound.synonyms if get_valid_cas(syn)]
                              if original_cas_for_validation in pubchem_cas_list_for_val: validated = True
-                        elif not original_cid_for_validation and not original_cas_for_validation: validated = True # No original data to check against
-
-                        if validated:
-                            found_compound = potential_compound; found_by = name_col # Accept match
-                        else:
-                            found_compound = potential_compound; found_by = name_col # Still Accept match
-                            cross_validation_passed = False # Mark validation failed for status reporting
-                            # overall_status = f"名称'{name_value}'匹配项(CID:{potential_compound.cid})未通过交叉验证" # Don't set final status yet
-                elif len(cids) > 1:
-                    overall_status = f"通过名称 '{name_value}' 找到多个匹配 ({len(cids)}个)"; multi_match_indices.add(index)
-                else:
-                    overall_status = f"通过名称 '{name_value}' 未找到匹配"
-            except Exception as e:
-                overall_status = f"查找名称 '{name_value}' 时出错: {e}"; print(f"错误: 行 {index + 2} - {overall_status}"); error_indices.add(index)
+                        elif not original_cid_for_validation and not original_cas_for_validation: validated = True
+                        found_compound = potential_compound; found_by = name_col # Accept match regardless
+                        if not validated: cross_validation_passed = False # Mark validation failed
+                elif len(cids) > 1: overall_status = f"通过名称 '{name_value}' 找到多个匹配 ({len(cids)}个)"; multi_match_indices.add(index)
+                else: overall_status = f"通过名称 '{name_value}' 未找到匹配"
+            except Exception as e: overall_status = f"查找名称 '{name_value}' 时出错: {e}"; print(f"错误: 行 {index + 2} - {overall_status}"); error_indices.add(index)
             time.sleep(api_delay)
 
         # Step 2: If not found by Name, try finding by Alias
@@ -231,138 +250,104 @@ if __name__ == "__main__":
             potential_compound_alias = None
             consistent_cid_from_aliases = None
             found_by_alias_detail = None
-
             if not is_nan_or_none(alias_value) and isinstance(alias_value, str) and alias_value.strip() != '':
                 aliases = [a.strip() for a in alias_value.split(';') if a.strip()]
                 if aliases:
-                    # --- Try the FIRST alias exclusively ---
-                    first_alias = aliases[0]
-                    first_alias_found_cid = None
+                    first_alias = aliases[0]; first_alias_found_cid = None
                     try:
-                        cids = pcp.get_cids(first_alias, 'name')
-                        time.sleep(api_delay)
-                        if len(cids) == 1:
-                            first_alias_found_cid = cids[0] # Store potential CID
+                        cids = pcp.get_cids(first_alias, 'name'); time.sleep(api_delay)
+                        if len(cids) == 1: first_alias_found_cid = cids[0]
                         elif len(cids) > 1:
                              if overall_status == "未处理" or "未找到匹配" in overall_status: overall_status = f"第一个别名 '{first_alias}' 找到多个匹配 ({len(cids)}个)"; multi_match_indices.add(index)
                     except Exception as e: print(f"警告: 行 {index + 2}, 查找第一个别名 '{first_alias}' 时出错: {e}"); error_indices.add(index)
 
-                    # --- If FIRST alias found unique CID, check it and potentially accept ---
                     if first_alias_found_cid:
                          try:
-                             potential_compound = pcp.Compound.from_cid(first_alias_found_cid)
-                             time.sleep(api_delay)
+                             potential_compound = pcp.Compound.from_cid(first_alias_found_cid); time.sleep(api_delay)
                              if potential_compound:
-                                 # --- Cross-Validation Check (Informational Only) ---
                                  validated = False
                                  if original_cid_for_validation and potential_compound.cid == original_cid_for_validation: validated = True
                                  elif original_cas_for_validation and potential_compound.synonyms:
                                       pubchem_cas_list_for_val = [get_valid_cas(syn) for syn in potential_compound.synonyms if get_valid_cas(syn)]
                                       if original_cas_for_validation in pubchem_cas_list_for_val: validated = True
                                  elif not original_cid_for_validation and not original_cas_for_validation: validated = True
-                                 # Accept the match regardless of validation result
                                  found_compound = potential_compound; found_by = f"{alias_col} ('{first_alias}')"
-                                 if not validated: cross_validation_passed = False # Mark validation failed for status reporting
+                                 if not validated: cross_validation_passed = False
                          except Exception as e: overall_status = f"获取第一个别名匹配的 CID {first_alias_found_cid} 时出错: {e}"; print(f"错误: 行 {index + 2} - {overall_status}"); error_indices.add(index);
-
-                    # --- If FIRST alias failed, try subsequent aliases with consistency check ---
-                    elif len(aliases) > 1: # Only proceed if first failed AND there are more aliases
-                        aliases_tried_str = ""
-                        found_cids_from_aliases = set()
-                        cid_to_alias_map = {}
-                        alias_found_multi = False
-                        aliases_to_attempt = aliases[1 : 1 + max_subsequent_aliases_to_try]
-                        aliases_tried_str = ', '.join([f"'{a}'" for a in aliases_to_attempt])
-
+                    elif len(aliases) > 1:
+                        aliases_tried_str = ""; found_cids_from_aliases = set(); cid_to_alias_map = {}; alias_found_multi = False
+                        aliases_to_attempt = aliases[1 : 1 + max_subsequent_aliases_to_try]; aliases_tried_str = ', '.join([f"'{a}'" for a in aliases_to_attempt])
                         if aliases_to_attempt:
                             for individual_alias in aliases_to_attempt:
                                 try:
-                                    cids = pcp.get_cids(individual_alias, 'name')
-                                    time.sleep(api_delay)
+                                    cids = pcp.get_cids(individual_alias, 'name'); time.sleep(api_delay)
                                     if len(cids) == 1:
-                                        found_cid = cids[0]
-                                        found_cids_from_aliases.add(found_cid)
+                                        found_cid = cids[0]; found_cids_from_aliases.add(found_cid)
                                         if found_cid not in cid_to_alias_map: cid_to_alias_map[found_cid] = individual_alias
                                     elif len(cids) > 1: alias_found_multi = True
                                 except Exception as e: print(f"警告: 行 {index + 2}, 查找后续别名 '{individual_alias}' 时出错: {e}"); error_indices.add(index)
-
                             if len(found_cids_from_aliases) == 1:
-                                consistent_cid_from_aliases = list(found_cids_from_aliases)[0]
-                                found_by_alias_detail = cid_to_alias_map.get(consistent_cid_from_aliases, aliases_to_attempt[0])
+                                consistent_cid_from_aliases = list(found_cids_from_aliases)[0]; found_by_alias_detail = cid_to_alias_map.get(consistent_cid_from_aliases, aliases_to_attempt[0])
                                 try:
-                                    potential_compound_alias = pcp.Compound.from_cid(consistent_cid_from_aliases)
-                                    time.sleep(api_delay)
+                                    potential_compound_alias = pcp.Compound.from_cid(consistent_cid_from_aliases); time.sleep(api_delay)
                                     if potential_compound_alias:
-                                         # --- Cross-Validation Check (Informational Only) ---
                                          validated = False
                                          if original_cid_for_validation and potential_compound_alias.cid == original_cid_for_validation: validated = True
                                          elif original_cas_for_validation and potential_compound_alias.synonyms:
                                               pubchem_cas_list_for_val = [get_valid_cas(syn) for syn in potential_compound_alias.synonyms if get_valid_cas(syn)]
                                               if original_cas_for_validation in pubchem_cas_list_for_val: validated = True
                                          elif not original_cid_for_validation and not original_cas_for_validation: validated = True
-                                         # Accept the match regardless of validation result
                                          found_compound = potential_compound_alias; found_by = f"{alias_col} ('{found_by_alias_detail}')"
-                                         if not validated: cross_validation_passed = False # Mark validation failed
+                                         if not validated: cross_validation_passed = False
                                 except Exception as e: overall_status = f"获取后续别名匹配的 CID {consistent_cid_from_aliases} 时出错: {e}"; print(f"错误: 行 {index + 2} - {overall_status}"); error_indices.add(index);
                             elif len(found_cids_from_aliases) > 1:
-                                if overall_status == "未处理" or "未找到匹配" in overall_status:
-                                     overall_status = f"通过尝试后续别名 {aliases_tried_str} 找到多个不同匹配 CIDs: {list(found_cids_from_aliases)}"
-                                     multi_match_indices.add(index)
-                            else: # No unique CIDs found from subsequent aliases
+                                if overall_status == "未处理" or "未找到匹配" in overall_status: overall_status = f"通过尝试后续别名 {aliases_tried_str} 找到多个不同匹配 CIDs: {list(found_cids_from_aliases)}"; multi_match_indices.add(index)
+                            else:
                                  current_status_prefix = overall_status if overall_status != "未处理" else ""
                                  subsequent_alias_status = ""
                                  if alias_found_multi: subsequent_alias_status = f"后续别名 {aliases_tried_str} 时找到多个匹配" ; multi_match_indices.add(index)
                                  else: subsequent_alias_status = f"后续别名 {aliases_tried_str} 未找到唯一匹配"
                                  overall_status = f"{current_status_prefix}; {subsequent_alias_status}".strip("; ")
-
-                    # If first alias failed and no subsequent aliases, update status
-                    elif len(aliases) <= 1: # Only the first alias existed and it failed
+                    elif len(aliases) <= 1:
                          if overall_status == "未处理" or "未找到匹配" in overall_status: overall_status = f"第一个别名 '{aliases[0]}' 未找到唯一匹配"
-
-
-                # If Alias string was empty or only whitespace
                 elif not aliases:
                      if overall_status == "未处理" or "未找到匹配" in overall_status: overall_status = f"别名列 '{alias_col}' 内容无效或为空"
 
-
         # Step 3: If not found by Name or Alias, try finding by PubChem ID
         if not found_compound:
-            cid_value_lookup = row.get(pubchem_id_col)
-            cid_to_lookup = get_valid_cid(cid_value_lookup)
+            cid_value_lookup = row.get(pubchem_id_col); cid_to_lookup = get_valid_cid(cid_value_lookup)
             if cid_to_lookup:
                 try:
-                    compound = pcp.Compound.from_cid(cid_to_lookup)
+                    compound = pcp.Compound.from_cid(cid_to_lookup);
                     if compound: found_compound = compound; found_by = pubchem_id_col
                 except pcp.NotFoundError:
                     if overall_status == "未处理" or "未找到匹配" in overall_status: overall_status = f"通过 PubChem ID {cid_to_lookup} 未找到"
                 except Exception as e: overall_status = f"查找 PubChem ID {cid_to_lookup} 时出错: {e}"; print(f"错误: 行 {index + 2} - {overall_status}"); error_indices.add(index)
                 time.sleep(api_delay)
             elif not is_nan_or_none(cid_value_lookup):
-                 if overall_status == "未处理" or "未找到匹配" in overall_status:
-                      overall_status = f"PubChem ID '{cid_value_lookup}' 格式无效"; error_indices.add(index)
-
+                 if overall_status == "未处理" or "未找到匹配" in overall_status: overall_status = f"PubChem ID '{cid_value_lookup}' 格式无效"; error_indices.add(index)
 
         # --- Step 4: Perform Detailed Comparison if a unique compound was found ---
         if found_compound:
+            # (Comparison logic remains the same, including conditional PubChem ID update and name/CAS protection)
+            # ... (omitted for brevity, same as previous version) ...
             updates_made_cols = []
             current_row_status_parts = []
             row_updated_flag = False
 
-            # Add cross-validation failure note if applicable (only if found by Name/Alias)
+            # Add cross-validation failure note if applicable
             if not cross_validation_passed and found_by and (found_by == name_col or found_by.startswith(alias_col)):
                  current_row_status_parts.append("(交叉验证失败:与原始ID/CAS不符)")
-                 cross_validation_failures_reported += 1 # Count reported failures
+                 cross_validation_failures_reported += 1
 
             # Check and Update PubChem ID if found by Name/Alias (Reverted Logic)
             if found_by and (found_by == name_col or found_by.startswith(alias_col)):
                 found_cid = found_compound.cid
                 original_cid_value = row.get(pubchem_id_col)
-                original_cid = None
-                original_id_is_valid = False
+                original_cid = None; original_id_is_valid = False
                 if not is_nan_or_none(original_cid_value) and str(original_cid_value).strip() != '':
                     try: original_cid = int(float(original_cid_value)); original_id_is_valid = True
                     except (ValueError, TypeError): original_id_is_valid = False
-                # Update if original is invalid OR different
                 if not original_id_is_valid or (original_id_is_valid and original_cid != found_cid):
                     df.loc[index, pubchem_id_col] = found_cid
                     identifier_detail = found_by.split('(')[-1].split(')')[0].strip("'") if '(' in str(found_by) else found_by
@@ -373,33 +358,26 @@ if __name__ == "__main__":
             # --- Comparison Loop ---
             columns_to_compare = [col for col in all_input_columns if col not in [pubchem_id_col, status_column]]
             for input_col_name in columns_to_compare:
-                # (Comparison logic for CAS, Synonyms, and other attributes remains unchanged)
-                # ... (omitted for brevity, same as previous version) ...
                 normalized_col = normalize_column_name(input_col_name)
-                col_status = ""
-                update_needed = False
-                value_to_update = None
+                col_status = ""; update_needed = False; value_to_update = None
                 if normalized_col in PUBCHEM_PROPERTY_MAP:
                     pubchem_attr_name = PUBCHEM_PROPERTY_MAP[normalized_col]
                     if pubchem_attr_name is None: continue
                     original_value = row[input_col_name]
                     # CAS Handling
                     if pubchem_attr_name == 'cas_from_synonyms':
-                        pubchem_cas_list = []
+                        pubchem_cas_list = []; original_cas = get_valid_cas(original_value)
                         if found_compound.synonyms:
                             for syn in found_compound.synonyms:
-                                valid_cas = get_valid_cas(syn)
+                                valid_cas = get_valid_cas(syn);
                                 if valid_cas: pubchem_cas_list.append(valid_cas)
-                        original_cas = get_valid_cas(original_value)
                         if original_cas:
                             if pubchem_cas_list:
                                 if original_cas in pubchem_cas_list: col_status = f"{input_col_name}(CAS 一致)"
                                 else: col_status = f"{input_col_name}(CAS 不匹配 PubChem: {pubchem_cas_list})"
                             else: col_status = f"{input_col_name}(原始 CAS 有效，PubChem 未找到)"
                         else:
-                            if len(pubchem_cas_list) == 1:
-                                col_status = f"{input_col_name}(用 PubChem 唯一 CAS 更新)"
-                                update_needed = True; value_to_update = pubchem_cas_list[0]
+                            if len(pubchem_cas_list) == 1: col_status = f"{input_col_name}(用 PubChem 唯一 CAS 更新)"; update_needed = True; value_to_update = pubchem_cas_list[0]
                             elif len(pubchem_cas_list) > 1: col_status = f"{input_col_name}(原始 CAS 无效/缺失, PubChem 提供多个: {pubchem_cas_list})"
                             else: col_status = f"{input_col_name}(原始 CAS 无效/缺失, PubChem 未提供)"
                         if col_status: current_row_status_parts.append(col_status)
@@ -417,9 +395,7 @@ if __name__ == "__main__":
                     else:
                         pubchem_value = getattr(found_compound, pubchem_attr_name, None)
                         if pubchem_value is None: continue
-                        is_name_attribute = pubchem_attr_name == 'iupac_name'
-                        needs_float = 'weight' in pubchem_attr_name or 'mass' in pubchem_attr_name or 'xlogp' in pubchem_attr_name or 'tpsa' in pubchem_attr_name
-                        needs_int = 'count' in pubchem_attr_name or 'charge' in pubchem_attr_name
+                        is_name_attribute = pubchem_attr_name == 'iupac_name'; needs_float = 'weight' in pubchem_attr_name or 'mass' in pubchem_attr_name or 'xlogp' in pubchem_attr_name or 'tpsa' in pubchem_attr_name; needs_int = 'count' in pubchem_attr_name or 'charge' in pubchem_attr_name
                         comparison_result_consistent = False
                         try:
                             if is_nan_or_none(original_value): update_needed = True; value_to_update = pubchem_value
@@ -448,7 +424,6 @@ if __name__ == "__main__":
                     if update_needed:
                         df.loc[index, input_col_name] = value_to_update
                         if input_col_name != pubchem_id_col: updates_made_cols.append(input_col_name); updated_indices.add(index); row_updated_flag = True
-
 
             # Determine Overall Status based on comparison results
             match_prefix = f"匹配成功 (通过 {found_by})"
@@ -531,4 +506,3 @@ if __name__ == "__main__":
         except KeyError as e: print(f"错误: 创建摘要时列名不存在: {e}。摘要文件未创建。")
         except Exception as e: print(f"保存摘要文件 '{output_file_summary}' 时出错: {e}")
     else: print("错误：无法确定摘要文件的足够列，未创建摘要文件。")
-
